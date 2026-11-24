@@ -1,0 +1,232 @@
+name: Build APK Android
+
+# Simpan sebagai: .github/workflows/build-apk.yml
+# (hapus workflow lama export-web.yml supaya tidak jalan dobel)
+# Upload GlyphLink.zip ke ROOT repo. Setelah selesai, APK ada di:
+#   tab Releases di repo kamu (klik file .apk untuk unduh)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: godot-apk
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.3"
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    container:
+      image: barichello/godot-ci:4.3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cari atau ekstrak project
+        shell: bash {0}
+        run: |
+          P=$(find . -name project.godot -not -path "./.git/*" -not -path "./build/*" -print -quit)
+          if [ -z "$P" ]; then
+            echo "project.godot tidak ada, mencari file .zip di root repo..."
+            ls -la
+            mkdir -p game_src
+            for z in ./*.zip; do
+              if [ -f "$z" ]; then
+                echo "Ekstrak $z"
+                if command -v unzip >/dev/null 2>&1; then
+                  unzip -q -o "$z" -d game_src
+                else
+                  python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall('game_src')" "$z"
+                fi
+              fi
+            done
+            P=$(find . -name project.godot -not -path "./.git/*" -not -path "./build/*" -print -quit)
+          fi
+          if [ -z "$P" ]; then
+            echo "::error title=Project tidak ketemu::Upload GlyphLink.zip ke ROOT repo (jangan di dalam folder)."
+            exit 1
+          fi
+          PROJ=$(cd "$(dirname "$P")" && pwd)
+          echo "Project ada di: $PROJ"
+          ls "$PROJ"
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+
+      - name: Siapkan Godot, templates, Android SDK, keystore
+        shell: bash {0}
+        run: |
+          mkdir -p "$HOME/.local/share/godot/export_templates" "$HOME/.config/godot"
+          SRC="/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          DST="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          if [ -d "$SRC" ] && [ ! -d "$DST" ]; then cp -r "$SRC" "$DST"; fi
+          ls "$DST" | head -n 30
+          godot --version || true
+
+          # --- Java (JDK 17)
+          JDK="${JAVA_HOME:-}"
+          if [ -z "$JDK" ] || [ ! -d "$JDK" ]; then
+            JAVAC=$(readlink -f "$(command -v javac)" 2>/dev/null)
+            JDK=$(dirname "$(dirname "$JAVAC")")
+          fi
+          echo "JDK=$JDK"
+          java -version 2>&1 | head -n 2
+
+          # --- Android SDK
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/lib/android-sdk}}"
+          [ -d "$SDK" ] || SDK=/usr/lib/android-sdk
+          mkdir -p "$SDK"
+          echo "SDK=$SDK"
+          ls "$SDK" || true
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            echo "cmdline-tools belum ada, mengunduh..."
+            wget -q "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -O /tmp/cmdtools.zip
+            mkdir -p "$SDK/cmdline-tools"
+            unzip -q -o /tmp/cmdtools.zip -d "$SDK/cmdline-tools"
+            rm -rf "$SDK/cmdline-tools/latest"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          fi
+          if [ -z "$(ls -A "$SDK/build-tools" 2>/dev/null)" ] || [ ! -d "$SDK/platform-tools" ]; then
+            echo "build-tools/platform-tools belum ada, install via sdkmanager..."
+            yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null 2>&1
+            "$SDKM" --sdk_root="$SDK" "platform-tools" "build-tools;34.0.0" "platforms;android-34"
+          fi
+          ls "$SDK/build-tools" || true
+
+          # --- keystore (tanda tangan APK)
+          KS=/root/debug.keystore
+          if [ ! -f "$KS" ]; then
+            KS="$HOME/debug.keystore"
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android -keystore "$KS" -storepass android -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          fi
+          echo "KS=$KS"
+
+          # --- pengaturan editor Godot
+          for D in "$HOME/.config/godot" /root/.config/godot; do
+            mkdir -p "$D"
+            for F in editor_settings-4.tres editor_settings-4.3.tres; do
+              cat > "$D/$F" <<SETTINGS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/java_sdk_path = "$JDK"
+          export/android/android_sdk_path = "$SDK"
+          export/android/debug_keystore = "$KS"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          export/android/force_system_user = false
+          export/android/shutdown_adb_on_exit = true
+          SETTINGS
+            done
+          done
+          cat "$HOME/.config/godot/editor_settings-4.tres"
+          {
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$KS"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$KS"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=androiddebugkey"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+
+      - name: Import resource
+        shell: bash {0}
+        run: |
+          cd "$PROJ"
+          for i in 1 2; do
+            timeout 900 godot --headless --import > "$GITHUB_WORKSPACE/import$i.log" 2>&1
+            echo "import #$i selesai, exit code: $?"
+            tail -n 15 "$GITHUB_WORKSPACE/import$i.log"
+          done
+
+      - name: Tes jalan (smoke test, tidak menggagalkan build)
+        continue-on-error: true
+        shell: bash {0}
+        run: |
+          cd "$PROJ"
+          timeout 300 godot --headless --path "$PROJ" -- --smoke > "$GITHUB_WORKSPACE/smoke.log" 2>&1
+          echo "smoke exit code: $?"
+          {
+            echo "### Tes jalan game"
+            echo '```'
+            grep -E "SMOKE|SCRIPT ERROR|Parse Error|Failed to load|ERROR:" "$GITHUB_WORKSPACE/smoke.log" | awk '!seen[$0]++' | head -n 60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -qE "SCRIPT ERROR|Parse Error" "$GITHUB_WORKSPACE/smoke.log"; then
+            echo "::warning title=Ada error script::Lihat Summary / artifact logs"
+          fi
+
+      - name: Export APK
+        shell: bash {0}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build/android"
+          cd "$PROJ"
+          APK="$GITHUB_WORKSPACE/build/android/GlyphLink.apk"
+          godot --headless --verbose --path "$PROJ" --export-release "Android" "$APK" > "$GITHUB_WORKSPACE/export.log" 2>&1
+          echo "export release exit code: $?"
+          tail -n 30 "$GITHUB_WORKSPACE/export.log"
+          if [ ! -s "$APK" ]; then
+            echo "Release gagal, mencoba export debug..."
+            godot --headless --verbose --path "$PROJ" --export-debug "Android" "$APK" > "$GITHUB_WORKSPACE/export-debug.log" 2>&1
+            echo "export debug exit code: $?"
+            tail -n 30 "$GITHUB_WORKSPACE/export-debug.log"
+          fi
+          ls -la "$GITHUB_WORKSPACE/build/android"
+          if [ ! -s "$APK" ]; then
+            echo "::error title=Export APK gagal::APK tidak terbentuk. Buka artifact 'logs' -> export.log"
+            grep -hE "ERROR|Cannot export|configuration errors|No export template|keystore|SDK" "$GITHUB_WORKSPACE"/export*.log | awk '!seen[$0]++' | head -n 25
+            exit 1
+          fi
+
+      - name: Simpan log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: "*.log"
+          if-no-files-found: ignore
+
+      - name: Simpan APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: build/android/GlyphLink.apk
+
+  release:
+    name: Terbitkan APK di Releases
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Ambil APK
+        uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: out
+
+      - name: Buat release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="apk-${{ github.run_number }}"
+          ls -la out
+          gh release create "$TAG" out/GlyphLink.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Glyph Link APK #${{ github.run_number }}" \
+            --notes "Unduh GlyphLink.apk lalu install di ponsel Android (izinkan install dari sumber tidak dikenal)."
+          {
+            echo "### APK siap diunduh"
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+            echo ""
+            echo "Buka link di atas dari ponsel, tap GlyphLink.apk, lalu install."
+          } >> "$GITHUB_STEP_SUMMARY"
